@@ -1,27 +1,35 @@
-name: Stream Extractor
+name: Multiembed Stream Extractor
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Embed URL to resolve"
-        required: true
+        description: "Input URL (multiembed.mov or streamingnow.mov)"
+        required: false
         default: "https://multiembed.mov/?video_id=931285&tmdb=1"
       all_servers:
-        description: "All servers? (true/false)"
+        description: "Try all servers? (true/false)"
         required: false
         default: "true"
+      retries:
+        description: "Proxy retry attempts"
+        required: false
+        default: "3"
+  repository_dispatch:
+    types: [extract]
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours (optional; remove if not needed)
 
 jobs:
   extract:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -29,28 +37,77 @@ jobs:
       - name: Install dependencies
         run: pip install curl_cffi
 
-      - name: Run extractor
+      - name: Resolve stream URL
+        id: resolve
+        env:
+          INPUT_URL: ${{ github.event.inputs.url || github.event.client_payload.url || 'https://multiembed.mov/?video_id=931285&tmdb=1' }}
+          ALL_SERVERS: ${{ github.event.inputs.all_servers || github.event.client_payload.all_servers || 'true' }}
+          RETRIES: ${{ github.event.inputs.retries || github.event.client_payload.retries || '3' }}
         run: |
-          FLAG=""
-          [ "${{ github.event.inputs.all_servers }}" = "false" ] && FLAG="--single"
-          python multiembed.py "${{ github.event.inputs.url }}" $FLAG --debug 2>&1 | tee /tmp/raw.txt
-          # last JSON block is the result
+          FLAGS=""
+          [ "$ALL_SERVERS" = "false" ] && FLAGS="$FLAGS --single"
+          python multiembed.py "$INPUT_URL" \
+            --dump \
+            --retries "$RETRIES" \
+            $FLAGS \
+            > result.json 2> run.log
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          cat result.json
+
+      - name: Show run log
+        if: always()
+        run: cat run.log
+
+      - name: Check result
+        run: |
           python - << 'PY'
-          import sys, json, re
-          raw = open("/tmp/raw.txt").read()
-          m = re.search(r'(\{.*\})\s*$', raw, re.S)
-          if m:
-              data = json.loads(m.group(1))
-              print(json.dumps(data, indent=2))
-              open("result.json","w").write(json.dumps(data, indent=2))
+          import json, sys
+          with open("result.json") as f:
+              r = json.load(f)
+          print(f"ok={r['ok']}  status={r['status']}")
+          print(f"stream_urls ({len(r['stream_urls'])}):")
+          for u in r['stream_urls']:
+              print(" ", u)
+          print(f"iframe_urls ({len(r['iframe_urls'])}):")
+          for u in r['iframe_urls']:
+              print(" ", u)
+          if not r['ok']:
+              print("::warning::No stream URLs found")
           PY
 
-      - name: Show result
-        run: cat result.json || echo "No result.json"
-
-      - name: Upload result artifact
+      - name: Upload result JSON
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: stream-result
           path: result.json
+          retention-days: 7
+
+      - name: Upload dump folder (debug HTML responses)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dump-responses
+          path: dump/
+          if-no-files-found: ignore
           retention-days: 3
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-log
+          path: run.log
+          retention-days: 7
+
+      - name: Commit result to repo
+        if: success()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p output
+          cp result.json output/result.json
+          git add output/result.json
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "chore: update stream result [skip ci]"
+          git push
