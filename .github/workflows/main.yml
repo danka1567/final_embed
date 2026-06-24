@@ -1,0 +1,51 @@
+name: Stream Extractor
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Embed URL to resolve"
+        required: true
+        default: "https://multiembed.mov/?video_id=931285&tmdb=1"
+      all_servers:
+        description: "Extract from all servers (true/false)"
+        required: false
+        default: "true"
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install curl_cffi
+
+      - name: Run extractor
+        env:
+          INPUT_URL: ${{ github.event.inputs.url }}
+          ALL_SERVERS: ${{ github.event.inputs.all_servers }}
+        run: |
+          ALL_FLAG=""
+          if [ "$ALL_SERVERS" = "false" ]; then
+            ALL_FLAG="--single"
+          fi
+          python multiembed.py "$INPUT_URL" $ALL_FLAG --debug 2>&1 | tee result.json
+          echo "--- RESULT ---"
+          cat result.json
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: stream-result
+          path: result.json
+          retention-days: 1
