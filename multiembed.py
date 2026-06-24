@@ -90,7 +90,7 @@ def _fail_proxy(label: str):
 STREAM_URL_RE   = re.compile(r'(?:https?:)?//[^\s"\'<>\\]+?\.(?:m3u8|mpd|mp4|m3u)(?:\?[^\s"\'<>\\]*)?', re.I)
 PLAYER_FILE_RE  = re.compile(r"""(?:file|src|url)\s*[:=]\s*(['"])(?P<url>https?://.*?\.(?:m3u8|mpd|mp4)(?:\?.*?)?)\1""", re.I | re.S)
 PLAYERJS_RE     = re.compile(r"""Playerjs\s*\(\s*\{[^}]*file\s*:\s*['"]([^'"]+)['"]""", re.I | re.S)
-BASE64_RE       = re.compile(r'(?:atob|btoa)\s*\(\s*["\']([A-Za-z0-9+/=]{20,})["\'])' , re.I)
+BASE64_RE       = re.compile(r'(?:atob|btoa)\s*\(\s*["\']([A-Za-z0-9+/=]{20,})["\']\)', re.I)
 VIPSTREAM_RE    = re.compile(r'(?:window\.location\.href|src)\s*=\s*["\']([^"\']*vipstream[^"\']*)["\']', re.I)
 PLAY_TOKEN_RE   = re.compile(r"""[?&]play=([^&"'<>]+)""", re.I)
 LOAD_SRC_RE     = re.compile(r"""load_sources\((['"])(?P<t>[^'"]+)\1\)""")
