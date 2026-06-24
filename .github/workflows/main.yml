@@ -11,6 +11,10 @@ on:
         description: "All servers? (true/false)"
         required: false
         default: "true"
+      deep:
+        description: "Deep mode — fetch every embed page (true/false)"
+        required: false
+        default: "false"
 
 jobs:
   extract:
@@ -31,14 +35,14 @@ jobs:
 
       - name: Run extractor
         run: |
-          FLAG=""
-          [ "${{ github.event.inputs.all_servers }}" = "false" ] && FLAG="--single"
-          python multiembed.py "${{ github.event.inputs.url }}" $FLAG --debug 2>&1 | tee /tmp/raw.txt
-          # last JSON block is the result
+          FLAGS=""
+          [ "${{ github.event.inputs.all_servers }}" = "false" ] && FLAGS="$FLAGS --single"
+          [ "${{ github.event.inputs.deep }}"        = "true"  ] && FLAGS="$FLAGS --deep"
+          python multiembed.py "${{ github.event.inputs.url }}" $FLAGS --debug 2>&1 | tee /tmp/raw.txt
           python - << 'PY'
           import sys, json, re
           raw = open("/tmp/raw.txt").read()
-          m = re.search(r'(\{.*\})\s*$', raw, re.S)
+          m = re.search(r'(\{[^{].*\})\s*$', raw, re.S)
           if m:
               data = json.loads(m.group(1))
               print(json.dumps(data, indent=2))
@@ -48,7 +52,7 @@ jobs:
       - name: Show result
         run: cat result.json || echo "No result.json"
 
-      - name: Upload result artifact
+      - name: Upload result
         uses: actions/upload-artifact@v4
         with:
           name: stream-result
