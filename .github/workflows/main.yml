@@ -18,7 +18,7 @@ on:
   repository_dispatch:
     types: [extract]
   schedule:
-    - cron: "0 */6 * * *"   # every 6 hours (optional; remove if not needed)
+    - cron: "0 */6 * * *"
 
 jobs:
   extract:
@@ -39,18 +39,20 @@ jobs:
 
       - name: Resolve stream URL
         id: resolve
-        env:
-          INPUT_URL: ${{ github.event.inputs.url || github.event.client_payload.url || 'https://multiembed.mov/?video_id=931285&tmdb=1' }}
-          ALL_SERVERS: ${{ github.event.inputs.all_servers || github.event.client_payload.all_servers || 'true' }}
-          RETRIES: ${{ github.event.inputs.retries || github.event.client_payload.retries || '3' }}
         run: |
+          INPUT_URL="${{ github.event.inputs.url || github.event.client_payload.url || 'https://multiembed.mov/?video_id=931285&tmdb=1' }}"
+          ALL_SERVERS="${{ github.event.inputs.all_servers || github.event.client_payload.all_servers || 'true' }}"
+          RETRIES="${{ github.event.inputs.retries || github.event.client_payload.retries || '3' }}"
+
           FLAGS=""
-          [ "$ALL_SERVERS" = "false" ] && FLAGS="$FLAGS --single"
+          [ "$ALL_SERVERS" = "false" ] && FLAGS="--single"
+
           python multiembed.py "$INPUT_URL" \
             --dump \
             --retries "$RETRIES" \
             $FLAGS \
             > result.json 2> run.log
+
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
           cat result.json
 
