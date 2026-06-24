@@ -8,7 +8,7 @@ on:
         required: true
         default: "https://multiembed.mov/?video_id=931285&tmdb=1"
       all_servers:
-        description: "Extract from all servers (true/false)"
+        description: "All servers? (true/false)"
         required: false
         default: "true"
 
@@ -21,31 +21,36 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          pip install curl_cffi
+        run: pip install curl_cffi
 
       - name: Run extractor
-        env:
-          INPUT_URL: ${{ github.event.inputs.url }}
-          ALL_SERVERS: ${{ github.event.inputs.all_servers }}
         run: |
-          ALL_FLAG=""
-          if [ "$ALL_SERVERS" = "false" ]; then
-            ALL_FLAG="--single"
-          fi
-          python multiembed.py "$INPUT_URL" $ALL_FLAG --debug 2>&1 | tee result.json
-          echo "--- RESULT ---"
-          cat result.json
+          FLAG=""
+          [ "${{ github.event.inputs.all_servers }}" = "false" ] && FLAG="--single"
+          python multiembed.py "${{ github.event.inputs.url }}" $FLAG --debug 2>&1 | tee /tmp/raw.txt
+          # last JSON block is the result
+          python - << 'PY'
+          import sys, json, re
+          raw = open("/tmp/raw.txt").read()
+          m = re.search(r'(\{.*\})\s*$', raw, re.S)
+          if m:
+              data = json.loads(m.group(1))
+              print(json.dumps(data, indent=2))
+              open("result.json","w").write(json.dumps(data, indent=2))
+          PY
 
-      - name: Upload result
+      - name: Show result
+        run: cat result.json || echo "No result.json"
+
+      - name: Upload result artifact
         uses: actions/upload-artifact@v4
         with:
           name: stream-result
           path: result.json
-          retention-days: 1
+          retention-days: 3
