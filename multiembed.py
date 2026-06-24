@@ -7,7 +7,7 @@ Requires:
     pip install curl_cffi
 
 Run:
-    python multiembed.py [url] [--debug] [--single]
+    python multiembed.py [url] [--debug] [--single] [--dump]
     python multiembed.py --serve --port 8787
 """
 
@@ -43,7 +43,9 @@ DEFAULT_UA        = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 MAX_IFRAME_DEPTH = 3
-DEBUG = False
+DEBUG  = False
+DUMP   = False          # NEW: save raw playvideo HTML files for inspection
+DUMP_DIR = "dump"
 
 # ── proxy list ────────────────────────────────────────────────────────────────
 PROXIES = [
@@ -64,7 +66,6 @@ _failed_set: set = set()
 
 
 def _next_proxy(skip_failed: bool = True) -> Tuple[str, str]:
-    """Return (proxy_url, label). Rotates through proxies, skipping failed ones."""
     global _proxy_idx
     pool = [(i, p) for i, p in enumerate(PROXIES) if i not in _failed_set] if skip_failed else list(enumerate(PROXIES))
     if not pool:
@@ -89,7 +90,7 @@ def _fail_proxy(label: str):
 STREAM_URL_RE   = re.compile(r'(?:https?:)?//[^\s"\'<>\\]+?\.(?:m3u8|mpd|mp4|m3u)(?:\?[^\s"\'<>\\]*)?', re.I)
 PLAYER_FILE_RE  = re.compile(r"""(?:file|src|url)\s*[:=]\s*(['"])(?P<url>https?://.*?\.(?:m3u8|mpd|mp4)(?:\?.*?)?)\1""", re.I | re.S)
 PLAYERJS_RE     = re.compile(r"""Playerjs\s*\(\s*\{[^}]*file\s*:\s*['"]([^'"]+)['"]""", re.I | re.S)
-BASE64_RE       = re.compile(r'(?:atob|btoa)\s*\(\s*["\']([^"\']+)["\']\s*\)', re.I)
+BASE64_RE       = re.compile(r'(?:atob|btoa)\s*\(\s*["\']([A-Za-z0-9+/=]{20,})["\'])' , re.I)
 VIPSTREAM_RE    = re.compile(r'(?:window\.location\.href|src)\s*=\s*["\']([^"\']*vipstream[^"\']*)["\']', re.I)
 PLAY_TOKEN_RE   = re.compile(r"""[?&]play=([^&"'<>]+)""", re.I)
 LOAD_SRC_RE     = re.compile(r"""load_sources\((['"])(?P<t>[^'"]+)\1\)""")
@@ -108,6 +109,34 @@ JS_URL_PATTERNS = [
     re.compile(r"""['"](https?://[^'"]*(?:dood|dsvplay|vipstream|streamwish|mixdrop|playmogo|streamtape|voe\.sx|filemoon|upstream)[^'"]*)['"]""", re.I),
 ]
 ANY_URL_RE = re.compile(r'https?://[^\s"\'<>]+', re.I)
+
+# ── NEW: additional extraction patterns ───────────────────────────────────────
+# JWPlayer / VideoJS / Plyr sources array
+JWPLAYER_RE   = re.compile(r'jwplayer\s*\([^)]*\)\s*\.setup\s*\(\s*(\{.*?\})\s*\)', re.I | re.S)
+SOURCES_ARR_RE= re.compile(r'"sources"\s*:\s*\[([^\]]+)\]', re.I | re.S)
+# Generic base64 blob (not inside atob())
+RAW_B64_RE    = re.compile(r'["\']([A-Za-z0-9+/]{40,}={0,2})["\']')
+# Hex-encoded URLs
+HEX_URL_RE    = re.compile(r'(?:0x)?([0-9a-f]{60,})', re.I)
+# window.atob patterns
+WIN_ATOB_RE   = re.compile(r'(?:window\.)?atob\s*\(\s*["\']([A-Za-z0-9+/=]+)["\']\s*\)', re.I)
+# var/const/let assignments holding URLs
+VAR_URL_RE    = re.compile(r'(?:var|let|const)\s+\w+\s*=\s*["\']([^"\']*(?:m3u8|mpd|mp4)[^"\']*)["\']', re.I)
+# data-src / data-url attributes
+DATA_SRC_RE   = re.compile(r'data-(?:src|url|stream|file)\s*=\s*["\']([^"\']+)["\']', re.I)
+# Generic embed/player URLs worth recursing
+EMBED_DOMAIN_RE = re.compile(
+    r'https?://[^\s"\'<>]*(?:'
+    r'dood\.watch|ds2play\.com|dsvplay\.com|vipstream\.tv|'
+    r'streamwish\.com|streamwish\.to|mixdrop\.co|playmogo\.com|'
+    r'streamtape\.com|voe\.sx|filemoon\.sx|upstream\.to|'
+    r'vidplay\.online|vidplay\.site|vidsrc\.\w+|'
+    r'2embed\.\w+|smashystream\.\w+|'
+    r'embed\.su|ridoo\.net|'
+    r'moviesapi\.club|aniwave\.\w+'
+    r')[^\s"\'<>]*',
+    re.I
+)
 
 
 # ── dataclasses ───────────────────────────────────────────────────────────────
@@ -170,7 +199,18 @@ def hdrs(referer: str = None, origin: str = None, ajax: bool = False) -> Dict[st
     return h
 
 
-# ── Session: one persistent curl_cffi session per resolve() call ──────────────
+def _dump_file(name: str, content: str):
+    """Save raw response body to DUMP_DIR for manual inspection."""
+    if not DUMP:
+        return
+    os.makedirs(DUMP_DIR, exist_ok=True)
+    path = os.path.join(DUMP_DIR, name)
+    with open(path, "w", encoding="utf-8", errors="replace") as f:
+        f.write(content)
+    print(f"[dump] saved {path} ({len(content)} bytes)", file=sys.stderr)
+
+
+# ── Session ───────────────────────────────────────────────────────────────────
 class ProxySession:
     """
     Wraps a curl_cffi Session that keeps cookies across requests,
@@ -246,15 +286,30 @@ class ProxySession:
 # ── extraction helpers ────────────────────────────────────────────────────────
 def _b64_streams(text: str) -> List[str]:
     out = []
-    for m in BASE64_RE.findall(text):
+    for pat in (BASE64_RE, WIN_ATOB_RE):
+        for m in pat.finditer(text):
+            blob = m.group(1) if pat == WIN_ATOB_RE else m.group(1)
+            try:
+                decoded = base64.b64decode(blob + "==").decode("utf-8", errors="replace")
+                if any(x in decoded for x in [".m3u8", ".mpd", ".mp4", "http"]):
+                    out += _stream_urls(decoded)
+                    out += _embed_urls(decoded)
+            except Exception:
+                pass
+    # Also try raw base64 blobs that decode to URLs
+    for m in RAW_B64_RE.finditer(text):
+        blob = m.group(1)
         try:
-            out += _stream_urls(base64.b64decode(m + "==").decode("utf-8", errors="replace"))
+            decoded = base64.b64decode(blob + "==").decode("utf-8", errors="replace")
+            if any(x in decoded for x in [".m3u8", ".mpd", ".mp4"]):
+                out += _stream_urls(decoded)
         except Exception:
             pass
     return out
 
 
 def _unpack(js: str) -> str:
+    """Dean Edwards p,a,c,k,e,d unpacker."""
     if not EVAL_RE.search(js):
         return js
     try:
@@ -287,14 +342,30 @@ def _stream_urls(text: str) -> List[str]:
         urls += [m.group(0) for m in STAPE_RE.finditer(t)]
         urls += [m.group(1) for m in DOOD_RE.finditer(t)]
         urls += [m.group(1) for m in JSON_SRC_RE.finditer(t)]
+        urls += [m.group(1) for m in VAR_URL_RE.finditer(t)]
+        urls += [m.group(1) for m in DATA_SRC_RE.finditer(t) if any(x in m.group(1) for x in [".m3u8",".mpd",".mp4"])]
         urls += _b64_streams(t)
         urls += [m.group(1) for m in VIPSTREAM_RE.finditer(t)]
+        # JWPlayer sources
+        for jw in JWPLAYER_RE.finditer(t):
+            try:
+                inner = jw.group(1)
+                for sm in SOURCES_ARR_RE.finditer(inner):
+                    for fm in re.finditer(r'"file"\s*:\s*"([^"]+)"', sm.group(1)):
+                        urls.append(fm.group(1))
+            except Exception:
+                pass
     clean = []
     for u in urls:
         u = html.unescape(u).strip()
         if u.startswith("//"): u = "https:" + u
         if u.startswith("http"): clean.append(u)
     return uniq(clean)
+
+
+def _embed_urls(text: str) -> List[str]:
+    """Extract known embed/player domain URLs worth recursing into."""
+    return uniq(m.group(0) for m in EMBED_DOMAIN_RE.finditer(text))
 
 
 def _js_urls(text: str) -> List[str]:
@@ -309,6 +380,7 @@ def _js_urls(text: str) -> List[str]:
     for pat in JS_URL_PATTERNS:
         for m in pat.finditer(text):
             urls.append(m.group(1))
+    urls += _embed_urls(text)
     return uniq(u for u in urls if u and u != "https://")
 
 
@@ -367,6 +439,10 @@ def _process_embed(url: str, server_id: str, referer: str,
     if not body:
         return
 
+    if DUMP:
+        safe = re.sub(r'[^\w]', '_', p.netloc + p.path)[:60]
+        _dump_file(f"embed_d{depth}_{safe}.html", body)
+
     if any(x in url.lower() for x in ["dood", "dsvplay"]):
         du = _dood_url(body, final)
         if du and du not in result.stream_urls:
@@ -376,7 +452,7 @@ def _process_embed(url: str, server_id: str, referer: str,
         if s not in result.stream_urls:
             result.stream_urls.append(s)
 
-    nested = _iframe_urls(body, final) + _js_urls(body)
+    nested = _iframe_urls(body, final) + _js_urls(body) + _embed_urls(body)
     for nurl in uniq(nested):
         if nurl and nurl != "https://":
             if nurl not in result.iframe_urls:
@@ -385,7 +461,26 @@ def _process_embed(url: str, server_id: str, referer: str,
 
 
 # ── main resolver ─────────────────────────────────────────────────────────────
-def resolve(input_url: str, all_servers: bool = True) -> ResolveResult:
+def resolve(input_url: str, all_servers: bool = True,
+            proxy_retries: int = 3) -> ResolveResult:
+    """
+    Attempt to resolve with up to `proxy_retries` different proxy sessions
+    if the first one(s) yield no streams despite getting 200 responses
+    (happens when the site returns an obfuscated empty shell).
+    """
+    for attempt in range(max(1, proxy_retries)):
+        result = _resolve_once(input_url, all_servers)
+        if result.ok or result.status in ("error", "no_token"):
+            # Got streams, or a hard failure not worth retrying
+            return result
+        if attempt < proxy_retries - 1:
+            print(f"[retry] attempt {attempt+1} got no streams (status={result.status}), switching proxy…",
+                  file=sys.stderr)
+            # _next_proxy() will rotate automatically; just loop
+    return result
+
+
+def _resolve_once(input_url: str, all_servers: bool = True) -> ResolveResult:
     result = ResolveResult(input_url=input_url, ok=False, status="resolving")
     sess   = ProxySession()   # one session = one proxy = shared cookies
 
@@ -407,6 +502,9 @@ def resolve(input_url: str, all_servers: bool = True) -> ResolveResult:
             play_url, referer=input_url, origin=input_origin)
         print(f"[step2] HTTP {status}  {len(page)} bytes", file=sys.stderr)
 
+        if DUMP:
+            _dump_file("step2_page.html", page)
+
         play_token = play_token or _play_token(page)
         result.stream_urls += _stream_urls(page)
         result.iframe_urls += _iframe_urls(page, final_url)
@@ -419,16 +517,17 @@ def resolve(input_url: str, all_servers: bool = True) -> ResolveResult:
             result.ok = bool(result.stream_urls)
             return result
 
-        # ── 3. response.php (POST with same session = cookies carried) ────
+        # ── 3. response.php ───────────────────────────────────────────────
         response_url = urllib.parse.urljoin(play_url, "/response.php")
         status, _, _, resp_html = sess.post(
             response_url, {"token": play_token},
             referer=play_url, origin=play_origin)
         print(f"[step3] response.php HTTP {status}  {len(resp_html)} bytes", file=sys.stderr)
 
+        if DUMP:
+            _dump_file("step3_response.html", resp_html)
+
         if status == 403:
-            # Site checks that the POST comes from a browser that loaded the page.
-            # Retry once with an explicit Cookie echo if the session captured any.
             print("[warn] 403 on response.php – retrying with explicit headers", file=sys.stderr)
             status, _, _, resp_html = sess.post(
                 response_url, {"token": play_token},
@@ -451,7 +550,7 @@ def resolve(input_url: str, all_servers: bool = True) -> ResolveResult:
                 f"&token={urllib.parse.quote(play_token)}&init=1",
             )
             for attempt in range(2):
-                pv_status, _, _, pv_html = sess.get(
+                pv_status, pv_final, _, pv_html = sess.get(
                     pv_url, referer=play_url, origin=play_origin)
                 if pv_status == 403 and attempt == 0:
                     time.sleep(1); continue
@@ -460,16 +559,30 @@ def resolve(input_url: str, all_servers: bool = True) -> ResolveResult:
                     break
                 print(f"[step4] server {src.server_id} HTTP {pv_status}  {len(pv_html)} bytes", file=sys.stderr)
 
+                if DUMP:
+                    _dump_file(f"step4_server{src.server_id}.html", pv_html)
+
+                # ── expanded extraction ───────────────────────────────────
                 for s in _stream_urls(pv_html):
                     if s not in result.stream_urls:
                         result.stream_urls.append(s)
 
-                embeds = uniq(_iframe_urls(pv_html, pv_url) + _js_urls(pv_html))
+                # Collect embed candidates: iframes + JS URLs + known embed domains
+                embeds = uniq(
+                    _iframe_urls(pv_html, pv_final)
+                    + _js_urls(pv_html)
+                    + _embed_urls(pv_html)
+                )
                 for eu in embeds:
                     if eu and eu != "https://":
                         if eu not in result.iframe_urls:
                             result.iframe_urls.append(eu)
                         _process_embed(eu, src.server_id, pv_url, result, sess, depth=0)
+
+                # ── NEW: look for any remaining http URLs in the body ──────
+                # as a last-resort catch-all after all pattern matching
+                if not result.stream_urls:
+                    _fallback_scan(pv_html, result, sess, pv_url, src.server_id)
                 break
 
         result.stream_urls = uniq(u for u in result.stream_urls if u and u != "https://")
@@ -486,9 +599,48 @@ def resolve(input_url: str, all_servers: bool = True) -> ResolveResult:
         return result
 
 
+def _fallback_scan(body: str, result: ResolveResult,
+                   sess: ProxySession, referer: str, server_id: str):
+    """
+    Last-resort: if all pattern matching failed, find ANY http URL in the body,
+    filter to likely embed/player domains, and recurse into them.
+    Also try to decode any base64 blobs present.
+    """
+    print("[fallback] running fallback URL scan", file=sys.stderr)
+    # Decode all base64 blobs and scan them
+    decoded_bodies = []
+    for m in RAW_B64_RE.finditer(body):
+        try:
+            dec = base64.b64decode(m.group(1) + "==").decode("utf-8", errors="replace")
+            if len(dec) > 20 and dec.isprintable():
+                decoded_bodies.append(dec)
+                if DUMP:
+                    _dump_file(f"fallback_b64_{len(decoded_bodies)}.txt", dec)
+        except Exception:
+            pass
+
+    all_bodies = [body] + decoded_bodies
+    for b in all_bodies:
+        for s in _stream_urls(b):
+            if s not in result.stream_urls:
+                result.stream_urls.append(s)
+                print(f"[fallback] found stream: {s[:80]}", file=sys.stderr)
+
+        # Any URL that looks like a player/embed page
+        for m in ANY_URL_RE.finditer(b):
+            u = m.group(0).rstrip('",\'\\;)')
+            if any(kw in u for kw in [
+                "embed", "player", "play", "stream", "watch",
+                "m3u8", "mpd", "mp4", "hls", "dash"
+            ]):
+                if u not in result.iframe_urls:
+                    result.iframe_urls.append(u)
+                _process_embed(u, server_id, referer, result, sess, depth=0)
+
+
 # ── HTTP API server ───────────────────────────────────────────────────────────
 class ApiHandler(BaseHTTPRequestHandler):
-    server_version = "StreamResolver/6.0"
+    server_version = "StreamResolver/6.1"
 
     def do_GET(self):
         parsed = urllib.parse.urlsplit(self.path)
@@ -502,10 +654,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not url:
                     self._json({"ok": False, "error": "Missing url"}, 400); return
                 all_s = (params.get("all") or ["1"])[0] not in ("0", "false")
-                self._json(resolve(url, all_servers=all_s).to_dict())
+                retries = int((params.get("retries") or ["3"])[0])
+                self._json(resolve(url, all_servers=all_s, proxy_retries=retries).to_dict())
                 return
             self._json({"ok": False, "error": "Not found",
-                        "endpoints": ["/health", "/resolve?url=<url>"]}, 404)
+                        "endpoints": ["/health", "/resolve?url=<url>&retries=3"]}, 404)
         except Exception as exc:
             self._json({"ok": False, "error": str(exc)}, 500)
 
@@ -532,22 +685,27 @@ def serve(host: str, port: int):
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("url",     nargs="?", default=DEFAULT_INPUT_URL)
-    ap.add_argument("--serve", action="store_true")
-    ap.add_argument("--host",  default="127.0.0.1")
-    ap.add_argument("--port",  type=int, default=int(os.environ.get("PORT", "8787")))
-    ap.add_argument("--single",action="store_true", help="Only first server")
-    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("url",          nargs="?", default=DEFAULT_INPUT_URL)
+    ap.add_argument("--serve",      action="store_true")
+    ap.add_argument("--host",       default="127.0.0.1")
+    ap.add_argument("--port",       type=int, default=int(os.environ.get("PORT", "8787")))
+    ap.add_argument("--single",     action="store_true", help="Only first server")
+    ap.add_argument("--debug",      action="store_true")
+    ap.add_argument("--dump",       action="store_true",
+                    help="Save raw HTML responses to ./dump/ for inspection")
+    ap.add_argument("--retries",    type=int, default=3,
+                    help="How many proxy rotations to try before giving up (default: 3)")
     args = ap.parse_args(argv)
 
-    global DEBUG
+    global DEBUG, DUMP
     DEBUG = args.debug
+    DUMP  = args.dump
 
     if args.serve:
         serve(args.host, args.port)
         return 0
 
-    r = resolve(args.url, all_servers=not args.single)
+    r = resolve(args.url, all_servers=not args.single, proxy_retries=args.retries)
     print(json.dumps(r.to_dict(), indent=2, ensure_ascii=False))
     return 0 if r.ok else 2
 
